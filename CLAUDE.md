@@ -15,7 +15,7 @@ ThinkorSwim/
 ├── CLAUDE.md                                    # This file
 ├── studies/
 │   ├── 5m/
-│   │   ├── MNQ_5m_Permission_GoNoGo.ts         # Directional bias filter (EMA/MACD/VWAP)
+│   │   ├── MNQ_5m_Permission_GoNoGo.ts         # Directional bias filter (ADX/DMI/VWAP)
 │   │   └── MNQ_5m_Value_Framework.ts           # Value area levels & structural alerts
 │   └── 1m/
 │       └── MNQ_1m_Sniper_Execution.ts          # Execution triggers with arrows
@@ -23,22 +23,26 @@ ThinkorSwim/
 
 ## System Architecture
 
+### Design Principle: Signal Independence
+The Permission filter uses **ADX/DMI** for trend assessment. The Sniper uses **EMA/MACD** for momentum timing. These are genuinely independent indicator families — ADX measures trend strength via directional movement, while EMA/MACD measures momentum via price smoothing. Agreement between them carries more weight than two correlated signals.
+
 ### Layer 1: Permission Filter (`MNQ_5m_Permission_GoNoGo.ts`)
 **Timeframe:** 5-minute chart | **Role:** Directional gatekeeper
 
 Determines whether longs, shorts, or neither are permitted. Outputs a 3-state bias: BULL / BEAR / NEUTRAL.
 
 **Core logic:**
-- EMA(9) vs EMA(20) crossover for trend direction
-- MACD(12,26,9) above/below signal for momentum confirmation
+- ADX(14) >= 20 confirms a trend exists (replaces EMA spread filter)
+- DI+ vs DI- directional spread for trend direction (replaces EMA crossover)
+- DI spread minimum (default 3) filters ambiguous readings
 - Price vs VWAP (with buffer) for value alignment
-- Minimum EMA spread filter to avoid chop zones
 - `confirmBars` (default 2) consecutive qualifying bars required before bias flips
 - `holdBiasUntilOpposite` keeps bias sticky to reduce flip-flop
 
 **Key features:**
 - **Warmup gate**: Ignores first N RTH bars (default 3 = 15 min) to skip opening chaos
-- **Neutralizer**: Forces NEUTRAL if bias conditions degrade for N consecutive bars (VWAP zone re-entry, spread compression, momentum loss)
+- **Neutralizer**: Forces NEUTRAL if ADX weakens, DI spread compresses, or price re-enters VWAP zone
+- **TREND label**: Shows STRONG (ADX >= 30), TRENDING (>= 20), or WEAK/CHOP with rising/falling arrow
 - ATR-based stop/target bracket labels
 
 ### Layer 2: Value Framework (`MNQ_5m_Value_Framework.ts`)
@@ -48,7 +52,7 @@ Provides yesterday's value area (Y-VAH, Y-VAL, Y-POC), developing POC, overlap z
 
 **Core logic:**
 - VolumeProfile to compute developing VAH/VAL/POC each RTH session
-- Yesterday's levels latched once per day at RTH open (hard guard prevents re-latch)
+- **Dual-source Y-VA latch**: Primary snapshot at end-of-RTH transition (16:00, profile is complete); fallback running tracker for RTH-only charts. Prevents today's developing profile from contaminating yesterday's frozen levels on TOS recalculation.
 - Structural context: BULL (dVAL > yVAH), BEAR (dVAH < yVAL), BALANCED (overlap)
 - 2-step confirmation for breakout/reclaim signals (attempt bar + confirmation bar)
 
@@ -58,26 +62,28 @@ Provides yesterday's value area (Y-VAH, Y-VAL, Y-POC), developing POC, overlap z
 - **Overlap zone**: Intersection of yesterday's VA and today's developing VA
 - **LOC label**: Real-time location relative to value (ABOVE VAH, IN VALUE, etc.)
 - **SIG label**: Tracks last structural event (BREAK, RECLAIM, GAP FADE, KZ)
-- **Exports**: Hidden plots for Y-VAH, Y-VAL, dPOC usable by other studies
+- **Debug mode**: `showDebugPlots` shows Y-VA source (SNAP vs FALLBACK) and session count
+- **Exports**: Hidden plots for Y-VAH, Y-VAL, dPOC
 
 ### Layer 3: Sniper Execution (`MNQ_1m_Sniper_Execution.ts`)
 **Timeframe:** 1-minute chart | **Role:** Entry trigger generation
 
-Fires discrete LONG/SHORT pulse arrows when all conditions align.
+Fires discrete LONG/SHORT pulse arrows when all conditions align. Optimized for scalping latency.
 
 **Core logic:**
 - EMA(9) vs EMA(20) for micro-trend
 - MACD(6,13,5) — faster settings for 1m momentum
-- Volume >= 30% of 50-bar average (loose "wake up" check)
-- Price vs VWAP (with optional override for counter-trend entries)
+- Volume >= 80% of 50-bar average (meaningful filter); 120% for counter-VWAP trades
+- Context-aware VWAP override via reclaim window (see below)
 - Minimum EMA spread of 2 ticks to avoid knot zones
 
 **Key features:**
-- **Cooldown**: Minimum 2 bars between signals to prevent spam
-- **Reset logic**: Requires 2 bars of "off" before re-arming (prevents inside-bar whipsaws)
-- **VWAP Override**: `allowShortAboveVWAP` / `allowLongBelowVWAP` for reclaim/fade trades
-- **Volume Bias proxy**: 10-bar up/down volume imbalance label
-- Uses `useRTHOnly = no` by default (can trigger on globex data)
+- **Reduced latency**: cooldown=1, reset=1 (was 2 each) — minimum 2-bar delay instead of 4
+- **Momentum burst bypass**: When MACD histogram is >= 2x its 20-bar average, the reset requirement is skipped entirely for fast re-entry on impulsive moves
+- **Context-aware VWAP override**: Detects VWAP crosses and opens a 5-bar reclaim window. During the window, counter-VWAP entries are allowed (shorts above VWAP after a cross-up, longs below VWAP after a cross-down). Replaces the old static `allowShortAboveVWAP` / `allowLongBelowVWAP` toggles.
+- **Tiered volume**: Standard trades need 80% of average volume; counter-VWAP trades need 120% — higher conviction required when fighting the value anchor
+- **Volume Bias proxy**: 10-bar up/down volume imbalance label (informational only)
+- Uses `useRTHOnly = yes` by default (no globex noise)
 
 ## Intended Workflow
 
@@ -101,11 +107,13 @@ Fires discrete LONG/SHORT pulse arrows when all conditions align.
 - **Re-arm logic**: state tracks fired/distance/reset to prevent alert spam
 - **Tick rounding**: `Round(value / ts, 0) * ts` for clean price levels
 - **Session detection**: `inRTH and !inRTH[1]` fires exactly once at RTH open
+- **End-of-RTH detection**: `inRTH[1] and !inRTH` fires once at RTH close (for snapshots)
 - **Export pattern**: Hidden plots (`SetHiding(yes)`) to share data between studies
+- **Dual-source latch**: Primary snapshot + fallback tracker for robustness
 
 ### File Format
 - `.ts` extension for thinkScript files
-- Header block with `# ===...===` separators
+- Header block with `# ===...===` separators listing changes from previous version
 - Section separators with `# ---...---`
 - Inline comments for non-obvious logic
 
@@ -116,6 +124,7 @@ Fires discrete LONG/SHORT pulse arrows when all conditions align.
 2. Test in ThinkorSwim's thinkScript editor (compile check)
 3. Verify on historical data before live use
 4. Preserve `_keepAlive` plot and export plots
+5. TOS does not allow studies to be wired together — each must be self-contained
 
 ### Commit Message Format
 ```
@@ -142,5 +151,7 @@ Examples:
    - Max lookback is ~252 bars for daily aggregation
    - No external API calls
    - `reference VWAP()` must be used to access built-in VWAP
-7. **The 1m Sniper has `useRTHOnly = no` by default** — this is intentional for globex pre-market signals; don't change without asking
+   - TOS cannot wire studies together — each study must be independent
+   - VolumeProfile can repaint on chart reload — design latch logic accordingly
+7. **Maintain signal independence** — Permission uses ADX/DMI, Sniper uses EMA/MACD. Do not introduce correlated indicators across the two layers.
 8. **Tick math**: MNQ tick = 0.25 points. When the code says `Round(pts * 4, 0)` it's converting points to ticks

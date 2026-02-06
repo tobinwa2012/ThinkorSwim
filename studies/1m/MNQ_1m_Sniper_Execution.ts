@@ -1,8 +1,15 @@
 # =========================================================
-# MNQ_1Min_Sniper_Execution_AGG_v2c (Polished + FIXED) - VWAP OVERRIDE UPGRADE
-# NEW:
-#  - allowShortAboveVWAP: lets SHORT triggers fire even if price is above VWAP
-#  - allowLongBelowVWAP:  lets LONG triggers fire even if price is below VWAP (optional)
+# MNQ_1m_Sniper_Execution v2
+# Changes from v1:
+#   (1) Reduced latency: resetBarsNeeded=1, cooldownBars=1 (was 2 each)
+#   (2) Momentum burst bypass: strong MACD histogram skips reset
+#       requirement entirely — fast re-entry on impulsive moves
+#   (3) Context-aware VWAP override: auto-detects VWAP cross and opens
+#       a reclaim window (N bars) for counter-VWAP entries, replacing
+#       the static allowShortAboveVWAP/allowLongBelowVWAP toggles
+#   (4) Volume filter raised to 80% (was 30%), 120% for counter-VWAP
+#       trades — volume must confirm conviction on reclaim/fade entries
+#   (5) Default useRTHOnly=yes (was no) — no more globex noise arrows
 # =========================================================
 
 declare upper;
@@ -21,31 +28,25 @@ input macdSlow           = 13;
 input macdSignal         = 5;
 
 input volLength          = 50;
+input volThresholdPct    = 80;     # standard volume gate (was 30)
+input volThresholdCounterPct = 120; # higher bar for counter-VWAP trades
 
-# Keep loose: "wake up" check
-input volThresholdPct    = 30;
-
-# Aggressive controls
 input vwapBufferTicks    = 0;
-
-# IMPORTANT: Default ON so we don't fire in an EMA knot
 input minEMASpreadTicks  = 2;
 
-input cooldownBars       = 2;
+input cooldownBars       = 1;      # was 2 — faster re-fire for scalping
 input allowResetReFire   = yes;
-
-# Default to 2 to prevent "inside bar" whipsaws
-input resetBarsNeeded    = 2;
-
-# If allowResetReFire = NO, require a larger "full reset" to re-arm same direction
+input resetBarsNeeded    = 1;      # was 2 — faster re-arm
 input fullResetBars      = 4;
 
-# Hard Filter (Optional)
 input requirePriceVsVWAP = yes;
 
-# NEW: VWAP overrides (Option 1)
-input allowShortAboveVWAP = no;  # set YES for reclaim/fade shorts
-input allowLongBelowVWAP  = no;  # optional symmetry
+# Context-aware VWAP override (replaces static toggles)
+input reclaimWindowBars  = 5;      # bars after VWAP cross where counter-VWAP is allowed
+
+# Momentum burst: bypass reset when MACD histogram is very strong
+input momentumBurstMult  = 2.0;    # histogram must be >= 2x its average to bypass reset
+input momentumBurstLength = 20;    # lookback for average histogram strength
 
 # Visuals
 input paintBars          = yes;
@@ -55,7 +56,7 @@ input showLabels         = yes;
 # ----------------------------
 # Session gate
 # ----------------------------
-input useRTHOnly         = no;
+input useRTHOnly         = yes;    # was no — globex arrows were noise
 input rthStart           = 0930;
 input rthEnd             = 1600;
 
@@ -76,24 +77,62 @@ def spreadOK = emaSpreadTicks >= minEMASpreadTicks;
 def vwapRT  = reference VWAP();
 def vwapBuf = vwapBufferTicks * ts;
 
-# Volume filter
-def avgVol = Average(volume, volLength);
-def volConfirm = volume >= (avgVol * (volThresholdPct / 100));
+# MACD 1m (fast)
+def macdVal = ExpAverage(close, macdFast) - ExpAverage(close, macdSlow);
+def macdAvg = ExpAverage(macdVal, macdSignal);
+def macdHist = macdVal - macdAvg;
 
-# VWAP Logic
+def momUp = macdVal > macdAvg;
+def momDn = macdVal < macdAvg;
+
+# ----------------------------
+# Momentum burst detection
+# ----------------------------
+def avgHistStrength = Average(AbsValue(macdHist), momentumBurstLength);
+def momentumBurst = avgHistStrength > 0 and AbsValue(macdHist) >= (avgHistStrength * momentumBurstMult);
+
+# ----------------------------
+# Context-aware VWAP override
+# Detects VWAP crosses and opens a reclaim window for counter-VWAP trades
+# ----------------------------
 def aboveVW = close > (vwapRT + vwapBuf);
 def belowVW = close < (vwapRT - vwapBuf);
 
-# NEW: per-side VWAP permission
-def longVWOK  = if allowLongBelowVWAP  then 1 else aboveVW;
-def shortVWOK = if allowShortAboveVWAP then 1 else belowVW;
+def vwapCrossUp   = close > vwapRT and close[1] <= vwapRT;
+def vwapCrossDown = close < vwapRT and close[1] >= vwapRT;
 
-# MACD 1m (fast)
-def Value = ExpAverage(close, macdFast) - ExpAverage(close, macdSlow);
-def Avg   = ExpAverage(Value, macdSignal);
+rec barsSinceVWAPCross =
+    if BarNumber() == 1 then 999
+    else if vwapCrossUp or vwapCrossDown then 0
+    else barsSinceVWAPCross[1] + 1;
 
-def momUp = Value > Avg;
-def momDn = Value < Avg;
+def inReclaimWindow = barsSinceVWAPCross <= reclaimWindowBars;
+
+# Direction of last VWAP cross
+rec lastCrossDir =
+    if BarNumber() == 1 then 0
+    else if vwapCrossUp then 1
+    else if vwapCrossDown then -1
+    else lastCrossDir[1];
+
+# Longs: normally need above VWAP; after a cross-down, allow below for N bars (reclaim long)
+# Shorts: normally need below VWAP; after a cross-up, allow above for N bars (rejection short)
+def longVWOK  = aboveVW or (inReclaimWindow and lastCrossDir == -1);
+def shortVWOK = belowVW or (inReclaimWindow and lastCrossDir == 1);
+
+def isCounterVWAP =
+    (inReclaimWindow and lastCrossDir == -1 and !aboveVW) or
+    (inReclaimWindow and lastCrossDir == 1 and !belowVW);
+
+# ----------------------------
+# Volume filter (tiered)
+# ----------------------------
+def avgVol = Average(volume, volLength);
+def volStandard = volume >= (avgVol * (volThresholdPct / 100));
+def volCounter  = volume >= (avgVol * (volThresholdCounterPct / 100));
+
+# Counter-VWAP trades require higher volume conviction
+def volOK = if isCounterVWAP then volCounter else volStandard;
 
 # ----------------------------
 # ARMED conditions
@@ -103,7 +142,7 @@ def ArmedLong =
     EMA9 > EMA20 and
     momUp and
     (if requirePriceVsVWAP then longVWOK else yes) and
-    volConfirm and
+    volOK and
     spreadOK;
 
 def ArmedShort =
@@ -111,13 +150,13 @@ def ArmedShort =
     EMA9 < EMA20 and
     momDn and
     (if requirePriceVsVWAP then shortVWOK else yes) and
-    volConfirm and
+    volOK and
     spreadOK;
 
 def Armed = ArmedLong or ArmedShort;
 
 # ----------------------------
-# Reset tracking (FIXED)
+# Reset tracking
 # ----------------------------
 rec offCount =
     if BarNumber() == 1 then 999
@@ -128,10 +167,10 @@ def rearmOK = offCount[1] >= resetBarsNeeded;
 def fullResetOK = offCount >= fullResetBars;
 
 # ----------------------------
-# Trigger logic (FIXED)
+# Trigger logic (with momentum burst bypass)
 # ----------------------------
-def LongTurnOn  = ArmedLong  and !ArmedLong[1]  and rearmOK;
-def ShortTurnOn = ArmedShort and !ArmedShort[1] and rearmOK;
+def LongTurnOn  = ArmedLong  and !ArmedLong[1]  and (rearmOK or momentumBurst);
+def ShortTurnOn = ArmedShort and !ArmedShort[1] and (rearmOK or momentumBurst);
 
 rec longLocked =
     if BarNumber() == 1 then 0
@@ -202,20 +241,31 @@ AddLabel(showLabels,
 );
 
 AddLabel(showLabels,
-    "Vol: " + Round((volume / avgVol) * 100, 0) + "% | Spread: " + Round(emaSpreadTicks, 1) +
-    "t | Cool: " + cool + " | Off: " + offCount,
-    if volConfirm then Color.GREEN else Color.GRAY
+    "Vol: " + Round((volume / avgVol) * 100, 0) + "%" +
+    (if isCounterVWAP then " (need " + volThresholdCounterPct + "%)" else "") +
+    " | Spread: " + Round(emaSpreadTicks, 1) + "t" +
+    " | Cool: " + cool,
+    if volOK then Color.GREEN else Color.GRAY
 );
 
-# NEW: reminder label so you don't forget override is ON
+# Reclaim window status
 AddLabel(showLabels,
-    "VWAP OVERRIDE | ShortAbove: " + (if allowShortAboveVWAP then "ON" else "OFF") +
-    " | LongBelow: " + (if allowLongBelowVWAP then "ON" else "OFF"),
-    if (allowShortAboveVWAP or allowLongBelowVWAP) then Color.YELLOW else Color.DARK_GRAY
+    "VWAP: " +
+    (if inReclaimWindow then
+        "RECLAIM WINDOW (" + barsSinceVWAPCross + "/" + reclaimWindowBars + "b)" +
+        (if lastCrossDir == 1 then " Short OK" else " Long OK")
+     else "STRICT"),
+    if inReclaimWindow then Color.YELLOW else Color.DARK_GRAY
+);
+
+# Momentum burst indicator
+AddLabel(showLabels and momentumBurst,
+    "BURST",
+    Color.WHITE
 );
 
 # ----------------------------
-# Directional Bias (Proxy)
+# Directional Bias (Proxy — informational only)
 # ----------------------------
 input volBiasLookback   = 10;
 input volBiasImbalance  = 1.2;

@@ -1,10 +1,13 @@
 # =========================================================
-# MNQ_5m_Value_Framework_CLEAN_v1c_ASCII_B (Y-VA LOCK + SIG EVENT FIX)
-# Fixes:
-#   (1) Deterministic newSession (fires ONCE when entering RTH)
-#   (2) Hard guard so Y-VAH/Y-VAL/Y-POC can only latch once per day
-#   (3) SIG label now tracks last fired EVENT (matches Message Center)
-#   (4) Tick-rounding for cleaner prices / consistent levels
+# MNQ_5m_Value_Framework v2
+# Changes from v1:
+#   (1) Y-VA latch fix: snapshot at end-of-RTH transition (profile is
+#       complete at 16:00) instead of running tracker that can be
+#       contaminated by today's developing profile on TOS recalculation
+#   (2) Fallback path for RTH-only charts that lack an end-of-RTH bar
+#   (3) Freeze flag: lastRTH tracker resets on newSession to prevent
+#       today's developing profile from leaking into yesterday's values
+#   (4) All other logic unchanged (kill zones, overlap, gap fade, etc.)
 # =========================================================
 
 declare upper;
@@ -42,11 +45,11 @@ input alertOnPOC              = no;
 input alertOnOverlap          = no;
 
 # SENSITIVITY
-input useCloseCross           = yes;   # YES=close-confirmed; NO=touch
+input useCloseCross           = yes;
 input reArmTicks              = 10;
 input reArmTicksPOC           = 16;
 
-# 2-step confirmation buffers (ticks beyond level on confirmation bar)
+# 2-step confirmation buffers
 input confirmTicksVA          = 2;
 input confirmTicksOverlap     = 2;
 input confirmTicksPOC         = 4;
@@ -55,13 +58,13 @@ input confirmTicksPOC         = 4;
 input gateOverlapUntilTime    = yes;
 input overlapStartTime        = 1015;
 
-# Kill Zones (execution zones around Y-VAH / Y-VAL)
+# Kill Zones
 input kzEnable            = yes;
 input kzToleranceTicks    = 12;
 input kzReArmTicks        = 24;
 input kzShowCloud         = yes;
 input kzEnableAlerts      = yes;
-input kzUseCloseEntry     = yes;  # yes=close inside zone; no=touch (hi/lo)
+input kzUseCloseEntry     = yes;
 
 # 2-Label system
 input showLocationLabel   = yes;
@@ -79,7 +82,7 @@ def confOL       = confirmTicksOverlap * ts;
 def confPOC      = confirmTicksPOC * ts;
 
 # =========================================================
-# 1) Deterministic Day + RTH Session Logic (NO re-triggers)
+# 1) Deterministic Day + RTH Session Logic
 # =========================================================
 def newDay = GetDay() <> GetDay()[1];
 
@@ -93,12 +96,15 @@ def newSession =
     if !useRTHOnly then newDay
     else inRTH_now and !inRTH_now[1];
 
+# Fires once: the first bar AFTER RTH ends (globex bar at 16:00+)
+def endOfRTH = BarNumber() > 1 and inRTH_now[1] and !inRTH_now;
+
 def showNow = if useRTHOnly then inRTH_now else 1;
 
 # No alerts on first RTH bar
 def safeToAlert = showNow and !newSession and BarNumber() > 1;
 
-# Label gate (last bar only if desired)
+# Label gate
 def isLastBar = !IsNaN(close) and IsNaN(close[-1]);
 def statusGate = if statusLastBarOnly then isLastBar else yes;
 
@@ -114,10 +120,7 @@ def rawVAH = vp.GetHighestValueArea();
 def rawVAL = vp.GetLowestValueArea();
 def rawPOC = vp.GetPointOfControl();
 
-# Tick-round helper
-def RoundToTick = if ts > 0 then Round(close / ts, 0) * ts else close; # dummy to satisfy syntax
-
-# Developing levels (update only during RTH if useRTHOnly=yes)
+# Developing levels (update only during RTH)
 rec dVAH =
     if BarNumber() == 1 then na
     else if newSession then rawVAH
@@ -136,28 +139,60 @@ rec dPOC =
     else if (showNow and !IsNaN(rawPOC)) then rawPOC
     else dPOC[1];
 
-# Tick-rounded developing (clean display + consistent levels)
+# Tick-rounded developing levels
 def dVAH_L = if !IsNaN(dVAH) then Round(dVAH / ts, 0) * ts else na;
 def dVAL_L = if !IsNaN(dVAL) then Round(dVAL / ts, 0) * ts else na;
 def dPOC_L = if !IsNaN(dPOC) then Round(dPOC / ts, 0) * ts else na;
 
 # =========================================================
-# 3) Capture FINAL RTH levels, then roll forward at RTH open
+# 3) Y-VA LATCH FIX: Dual-source snapshot
+#
+# PRIMARY: Capture at end-of-RTH transition. The profile is complete
+# at 16:00 and won't receive new bars. Reading rawVAH[1] at this
+# point gives the final value. This is immune to today's developing
+# profile contaminating the snapshot on TOS recalculation.
+#
+# FALLBACK: For RTH-only charts where endOfRTH never fires, use a
+# restricted running tracker that freezes once newSession fires.
 # =========================================================
-rec lastRTH_VAH =
+
+# --- PRIMARY: End-of-RTH snapshot (fires once per day at 16:00) ---
+rec snapVAH =
     if BarNumber() == 1 then na
+    else if endOfRTH and !IsNaN(rawVAH[1]) then rawVAH[1]
+    else snapVAH[1];
+
+rec snapVAL =
+    if BarNumber() == 1 then na
+    else if endOfRTH and !IsNaN(rawVAL[1]) then rawVAL[1]
+    else snapVAL[1];
+
+rec snapPOC =
+    if BarNumber() == 1 then na
+    else if endOfRTH and !IsNaN(rawPOC[1]) then rawPOC[1]
+    else snapPOC[1];
+
+# --- FALLBACK: Running tracker that RESETS on newSession ---
+# By resetting to na on newSession, today's developing profile
+# cannot overwrite yesterday's final values in the rec chain.
+# The latch reads [1] which is the last pre-reset value.
+rec fallbackVAH =
+    if BarNumber() == 1 then na
+    else if newSession then na
     else if (showNow and !IsNaN(rawVAH)) then rawVAH
-    else lastRTH_VAH[1];
+    else fallbackVAH[1];
 
-rec lastRTH_VAL =
+rec fallbackVAL =
     if BarNumber() == 1 then na
+    else if newSession then na
     else if (showNow and !IsNaN(rawVAL)) then rawVAL
-    else lastRTH_VAL[1];
+    else fallbackVAL[1];
 
-rec lastRTH_POC =
+rec fallbackPOC =
     if BarNumber() == 1 then na
+    else if newSession then na
     else if (showNow and !IsNaN(rawPOC)) then rawPOC
-    else lastRTH_POC[1];
+    else fallbackPOC[1];
 
 # --- HARD GUARD: latch Y values ONCE per day only ---
 rec yLatchDay =
@@ -165,27 +200,46 @@ rec yLatchDay =
     else if newSession then GetDay()
     else yLatchDay[1];
 
+def firstLatch = newSession and yLatchDay[1] <> GetDay();
+
+# Latch Y-values: prefer endOfRTH snapshot, fall back to running tracker
 rec yVAH =
     if BarNumber() == 1 then na
-    else if newSession and yLatchDay[1] <> GetDay() and !IsNaN(lastRTH_VAH[1]) then lastRTH_VAH[1]
+    else if firstLatch then
+        (if !IsNaN(snapVAH) then snapVAH
+         else if !IsNaN(fallbackVAH[1]) then fallbackVAH[1]
+         else yVAH[1])
     else yVAH[1];
 
 rec yVAL =
     if BarNumber() == 1 then na
-    else if newSession and yLatchDay[1] <> GetDay() and !IsNaN(lastRTH_VAL[1]) then lastRTH_VAL[1]
+    else if firstLatch then
+        (if !IsNaN(snapVAL) then snapVAL
+         else if !IsNaN(fallbackVAL[1]) then fallbackVAL[1]
+         else yVAL[1])
     else yVAL[1];
 
 rec yPOC =
     if BarNumber() == 1 then na
-    else if newSession and yLatchDay[1] <> GetDay() and !IsNaN(lastRTH_POC[1]) then lastRTH_POC[1]
+    else if firstLatch then
+        (if !IsNaN(snapPOC) then snapPOC
+         else if !IsNaN(fallbackPOC[1]) then fallbackPOC[1]
+         else yPOC[1])
     else yPOC[1];
 
-# Tick-rounded Y levels (use everywhere)
+# Track which source was used (for debug label)
+rec ySource =
+    if BarNumber() == 1 then 0
+    else if firstLatch then
+        (if !IsNaN(snapVAH) then 1 else 2)
+    else ySource[1];
+
+# Tick-rounded Y levels
 def yVAH_L = if !IsNaN(yVAH) then Round(yVAH / ts, 0) * ts else na;
 def yVAL_L = if !IsNaN(yVAL) then Round(yVAL / ts, 0) * ts else na;
 def yPOC_L = if !IsNaN(yPOC) then Round(yPOC / ts, 0) * ts else na;
 
-# Use locked Y-VA from the bar BEFORE the open for gap detection
+# Gap detection: use Y-values from bar before open
 def yVAH_s = if newSession then yVAH_L[1] else yVAH_L;
 def yVAL_s = if newSession then yVAL_L[1] else yVAL_L;
 
@@ -200,7 +254,7 @@ def ctxCode =
     else 2;
 
 # =========================================================
-# 4) Overlap (Y ∩ dVA) + time gate
+# 4) Overlap (Y intersection dVA) + time gate
 # =========================================================
 def overlapHighRaw = Min(dVAH_L, yVAH_L);
 def overlapLowRaw  = Max(dVAL_L, yVAL_L);
@@ -488,7 +542,7 @@ AddLabel(showLocationLabel and showNow and statusGate,
     else Color.GRAY
 );
 
-# --- Event flags (these match the Alerts exactly) ---
+# --- Event flags ---
 def fireBreakAbove   = confirmBreakYVAH and stateYVAH[1] == 0;
 def fireBreakBelow   = confirmBreakYVAL and stateYVAL[1] == 0;
 
@@ -501,7 +555,7 @@ def fireGapBelowFade = crossedBackIn and gapDir[1] == -1;
 def fireKZTop = kzTopAlert;
 def fireKZBot = kzBotAlert;
 
-# --- SIG EVENT FIX: record the last *event* that fired (no contradictions) ---
+# --- SIG label: record last event ---
 def eventCode =
     if fireReclaimVAH then 5
     else if fireReclaimVAL then 6
@@ -545,7 +599,7 @@ AddLabel(showSignalLabel and showNow and statusGate,
 );
 
 # =========================================================
-# 9) Plots (minimal by default)
+# 9) Plots
 # =========================================================
 plot YVAHLine = if showYellowYVA and showNow and yReady then yVAH_L else na;
 YVAHLine.SetDefaultColor(Color.YELLOW);
@@ -595,7 +649,7 @@ AddCloud(
 );
 
 # =========================================================
-# 10) Status label (ASCII)
+# 10) Status label
 # =========================================================
 AddLabel(showStatusLabel and statusGate,
     if !showNow then "5m: RTH OFF"
@@ -615,10 +669,14 @@ AddLabel(showStatusLabel and statusGate,
 );
 
 # =========================================================
-# OPTIONAL DEBUG (toggle via input)
+# DEBUG (toggle via input)
 # =========================================================
 rec sessionCount = if BarNumber() == 1 then 0 else if newSession then sessionCount[1] + 1 else sessionCount[1];
-AddLabel(showDebugPlots, "DBG sessionsToday=" + sessionCount + " | inRTH=" + inRTH_now, Color.WHITE);
+AddLabel(showDebugPlots,
+    "DBG sess=" + sessionCount + " | inRTH=" + inRTH_now +
+    " | ySource=" + (if ySource == 1 then "SNAP" else if ySource == 2 then "FALLBACK" else "NONE"),
+    Color.WHITE
+);
 
 # ----------------------------
 # EXPORTS (for other studies)

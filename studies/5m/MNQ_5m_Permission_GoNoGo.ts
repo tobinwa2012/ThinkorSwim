@@ -1,8 +1,10 @@
 # =========================================================
-# MNQ_5m_Permission_GoNoGo_for_1m_vFinal_PLUS
-# Upgrades:
-#  (1) Warmup gate: ignore permission signals until N RTH bars complete
-#  (2) Neutralizer: if bias degrades for N bars, force NEUTRAL (reduces "stale bias")
+# MNQ_5m_Permission_GoNoGo v2
+# Changes from v1:
+#   (1) Replaced EMA/MACD with ADX/DMI — independent from Sniper's EMA/MACD
+#   (2) ADX threshold replaces EMA spread as trend quality gate
+#   (3) DI+/DI- directional spread replaces EMA crossover
+#   (4) Kept: VWAP alignment, warmup gate, neutralizer, confirmBars
 # =========================================================
 
 declare upper;
@@ -13,30 +15,26 @@ def ts = TickSize();
 # ----------------------------
 # Inputs
 # ----------------------------
-input fastEMA               = 9;
-input slowEMA               = 20;
-
-input macdFast              = 12;
-input macdSlow              = 26;
-input macdSignal            = 9;
+input adxLength             = 14;
+input adxMinTrend           = 20;    # ADX must be >= this to confirm a trend exists
+input adxStrongTrend        = 30;    # label-only: strong trend threshold
+input diSpreadMin           = 3;     # DI+ must lead DI- by this much (or vice versa)
 
 input atrLength             = 14;
 
 # Permission quality filters
 input confirmBars           = 2;     # require N consecutive 5m bars to CONFIRM a bias
 input vwapBufferTicks       = 2;     # must clear VWAP by this many ticks
-input minEMASpreadTicks     = 2;     # EMA9-EMA20 spread must be >= this many ticks
-input requireEMASlope       = yes;   # EMA9 rising for bull / falling for bear
 input holdBiasUntilOpposite = yes;   # reduces flip-flop
 
-# UPGRADE #1: Warmup Gate
+# Warmup Gate
 input warmupBars            = 3;     # 3 bars = first 15 minutes of RTH (5m chart)
 
-# UPGRADE #2: Neutralizer
-input neutralizeBars        = 2;     # require N consecutive "degrade" bars to force NEUTRAL
-input neutralizeOnVWAPZone  = yes;   # if price returns into VWAP buffer zone, neutralize
-input neutralizeOnSpreadLoss= yes;   # if EMA spread compresses below min, neutralize
-input neutralizeOnMomLoss   = yes;   # if MACD momentum condition fails, neutralize
+# Neutralizer
+input neutralizeBars        = 2;
+input neutralizeOnVWAPZone  = yes;
+input neutralizeOnWeakTrend = yes;   # ADX drops below adxMinTrend
+input neutralizeOnDISqueeze = yes;   # DI spread collapses below diSpreadMin
 
 # Session control
 input useRTHOnly            = yes;
@@ -90,48 +88,56 @@ def warmupDone = if !useRTHOnly then 1 else (rthBarCount > warmupBars);
 def allowPerm  = inRTH and warmupDone;
 
 # ----------------------------
-# Core calculations
+# Core: ADX/DMI (independent from Sniper's EMA/MACD)
 # ----------------------------
-def emaF = ExpAverage(close, fastEMA);
-def emaS = ExpAverage(close, slowEMA);
+def tr = TrueRange(high, close, low);
+def atrSmooth = WildersAverage(tr, adxLength);
 
-def emaSpreadTicks = AbsValue(emaF - emaS) / ts;
-def spreadOK = emaSpreadTicks >= minEMASpreadTicks;
+def plusDM  = if high - high[1] > low[1] - low and high - high[1] > 0
+              then high - high[1] else 0;
+def minusDM = if low[1] - low > high - high[1] and low[1] - low > 0
+              then low[1] - low else 0;
 
-def emaSlopeUp = emaF > emaF[1];
-def emaSlopeDn = emaF < emaF[1];
+def diPlus  = if atrSmooth > 0
+              then 100 * WildersAverage(plusDM, adxLength) / atrSmooth else 0;
+def diMinus = if atrSmooth > 0
+              then 100 * WildersAverage(minusDM, adxLength) / atrSmooth else 0;
 
-# MACD-style momentum
-def macdValue   = ExpAverage(close, macdFast) - ExpAverage(close, macdSlow);
-def macdSignalV = ExpAverage(macdValue, macdSignal);
+def dx = if (diPlus + diMinus) > 0
+         then 100 * AbsValue(diPlus - diMinus) / (diPlus + diMinus) else 0;
+def adxVal = WildersAverage(dx, adxLength);
 
-def momUp = macdValue > macdSignalV;
-def momDn = macdValue < macdSignalV;
+def trendExists  = adxVal >= adxMinTrend;
+def diSpread     = AbsValue(diPlus - diMinus);
+def diSpreadOK   = diSpread >= diSpreadMin;
+def bullDI       = diPlus > diMinus;
+def bearDI       = diMinus > diPlus;
+def adxRising    = adxVal > adxVal[1];
 
 # VWAP with buffer
 def vwap    = reference VWAP();
 def vwapBuf = vwapBufferTicks * ts;
 
-def aboveVWAP = close > (vwap + vwapBuf);
-def belowVWAP = close < (vwap - vwapBuf);
+def aboveVWAP  = close > (vwap + vwapBuf);
+def belowVWAP  = close < (vwap - vwapBuf);
 def inVWAPZone = AbsValue(close - vwap) <= vwapBuf;
 
-# Raw candidates (permission attempts) — only allowed after warmup
+# ----------------------------
+# Raw candidates
+# ----------------------------
 def bullCandidate =
     allowPerm and
-    emaF > emaS and
-    momUp and
-    aboveVWAP and
-    spreadOK and
-    (if requireEMASlope then emaSlopeUp else 1);
+    bullDI and
+    trendExists and
+    diSpreadOK and
+    aboveVWAP;
 
 def bearCandidate =
     allowPerm and
-    emaF < emaS and
-    momDn and
-    belowVWAP and
-    spreadOK and
-    (if requireEMASlope then emaSlopeDn else 1);
+    bearDI and
+    trendExists and
+    diSpreadOK and
+    belowVWAP;
 
 # ----------------------------
 # Confirmation counters
@@ -150,22 +156,19 @@ def bullConfirmed = bullCount >= confirmBars;
 def bearConfirmed = bearCount >= confirmBars;
 
 # ----------------------------
-# UPGRADE #2: Neutralizer (degrade counters)
-# Degrade = you were biased, but structure/momentum/value quality deteriorated
+# Neutralizer
 # ----------------------------
 def bullDegrade =
     (neutralizeOnVWAPZone and inVWAPZone) or
-    (neutralizeOnSpreadLoss and !spreadOK) or
-    (neutralizeOnMomLoss and !momUp) or
-    (emaF <= emaS) or
-    (if requireEMASlope then !emaSlopeUp else 0);
+    (neutralizeOnWeakTrend and !trendExists) or
+    (neutralizeOnDISqueeze and !diSpreadOK) or
+    (!bullDI);
 
 def bearDegrade =
     (neutralizeOnVWAPZone and inVWAPZone) or
-    (neutralizeOnSpreadLoss and !spreadOK) or
-    (neutralizeOnMomLoss and !momDn) or
-    (emaF >= emaS) or
-    (if requireEMASlope then !emaSlopeDn else 0);
+    (neutralizeOnWeakTrend and !trendExists) or
+    (neutralizeOnDISqueeze and !diSpreadOK) or
+    (!bearDI);
 
 rec bullDegCount =
     if !allowPerm then 0
@@ -240,12 +243,25 @@ AddLabel(yes,
      else if BullBias then "BULL (Longs OK)"
      else if BearBias then "BEAR (Shorts OK)"
      else "NEUTRAL") +
-    " | Spread: " + Round(emaSpreadTicks, 1) + "t | VWAPbuf: " + vwapBufferTicks + "t",
+    " | ADX: " + Round(adxVal, 1) +
+    " | DI+: " + Round(diPlus, 1) +
+    " DI-: " + Round(diMinus, 1),
     if !inRTH then Color.DARK_GRAY
     else if !warmupDone then Color.GRAY
     else if BullBias then Color.GREEN
     else if BearBias then Color.RED
     else Color.GRAY
+);
+
+AddLabel(yes,
+    "TREND: " +
+    (if adxVal >= adxStrongTrend then "STRONG"
+     else if adxVal >= adxMinTrend then "TRENDING"
+     else "WEAK/CHOP") +
+    (if adxRising then " ^" else " v"),
+    if adxVal >= adxStrongTrend then Color.GREEN
+    else if adxVal >= adxMinTrend then Color.YELLOW
+    else Color.RED
 );
 
 AddLabel(yes,
