@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-A **3-study thinkScript system for scalping MNQ (Micro E-mini Nasdaq-100) futures** on ThinkorSwim (TOS). The system uses a multi-timeframe approach: two 5-minute studies establish directional bias and structural context, while a 1-minute study provides precise execution triggers.
+A **4-study thinkScript system for scalping MNQ (Micro E-mini Nasdaq-100) futures** on ThinkorSwim (TOS). The system uses a multi-timeframe approach: a 30-minute study provides macro context, two 5-minute studies establish directional bias and structural context, and a 1-minute study provides precise execution triggers.
 
 **Instrument:** MNQ (tick size = 0.25 points, $0.50/tick)
 **Platform:** ThinkorSwim by Charles Schwab
@@ -14,6 +14,8 @@ A **3-study thinkScript system for scalping MNQ (Micro E-mini Nasdaq-100) future
 ThinkorSwim/
 ├── CLAUDE.md                                    # This file
 ├── studies/
+│   ├── 30m/
+│   │   └── MNQ_30m_Macro_Context.ts            # Session type, IB, migration, weekly VWAP
 │   ├── 5m/
 │   │   ├── MNQ_5m_Permission_GoNoGo.ts         # Directional bias filter (ADX/DMI/VWAP)
 │   │   └── MNQ_5m_Value_Framework.ts           # Value area levels & structural alerts
@@ -24,7 +26,30 @@ ThinkorSwim/
 ## System Architecture
 
 ### Design Principle: Signal Independence
-The Permission filter uses **ADX/DMI** for trend assessment. The Sniper uses **EMA/MACD** for momentum timing. These are genuinely independent indicator families — ADX measures trend strength via directional movement, while EMA/MACD measures momentum via price smoothing. Agreement between them carries more weight than two correlated signals.
+Each layer uses a different information source:
+- **Macro Context (30m)**: Price structure + value migration (IB range, VA shift, weekly VWAP)
+- **Permission (5m)**: Trend strength via **ADX/DMI** (directional movement)
+- **Value Framework (5m)**: Market microstructure (volume profile, value areas)
+- **Sniper (1m)**: Momentum timing via **EMA/MACD** (price smoothing)
+
+Agreement across independent sources carries more weight than correlated signals.
+
+### Layer 0: Macro Context (`MNQ_30m_Macro_Context.ts`)
+**Timeframe:** 30-minute chart | **Role:** Session classification + macro structure
+
+Answers: Is this a trend day or rotation day? How extended is the move? Is value migrating?
+
+**Core logic:**
+- **Initial Balance** (IB): First hour's high/low (2 bars on 30m). Key intraday reference.
+- **Session type**: TREND UP (accepted above IB), TREND DOWN (accepted below IB), ROTATION (inside IB or both-sided breakout), IB BREAK (testing, not yet accepted)
+- **Value migration**: Compares today's developing POC/VAL/VAH vs yesterday's. Adaptive threshold (15% of Y-VA range) prevents noise.
+- **Weekly VWAP**: Manual computation of volume-weighted average price across the week. Institutional-scale value anchor independent from daily VWAP.
+
+**Key features:**
+- **IB extension metric**: Shows how far price has moved beyond IB in multiples of IB range (e.g., 1.5R = 1.5x the IB range)
+- **Background color**: Green tint = trend up day, red tint = trend down day, no tint = rotation/forming
+- **Adjustable IB period**: Change `ibBars` for other timeframes (4 for 15m, 1 for 1h)
+- **Y-VA latch**: Same endOfRTH snapshot + fallback fix as Value Framework
 
 ### Layer 1: Permission Filter (`MNQ_5m_Permission_GoNoGo.ts`)
 **Timeframe:** 5-minute chart | **Role:** Directional gatekeeper
@@ -87,11 +112,14 @@ Fires discrete LONG/SHORT pulse arrows when all conditions align. Optimized for 
 
 ## Intended Workflow
 
-1. Check **Permission** study on 5m — is bias BULL, BEAR, or NEUTRAL?
-2. Check **Value Framework** on 5m — where is price relative to Y-VA? Any fresh signals?
-3. If permission is granted and location is favorable, watch **Sniper** on 1m for arrows
-4. Only take 1m arrows that align with 5m permission direction
-5. Use kill zones and value levels for stop/target placement
+1. Check **Macro Context** on 30m — trend day or rotation? How extended beyond IB? Where is weekly VWAP?
+2. Check **Permission** study on 5m — is bias BULL, BEAR, or NEUTRAL?
+3. Check **Value Framework** on 5m — where is price relative to Y-VA? Any fresh signals?
+4. If permission is granted and location is favorable, watch **Sniper** on 1m for arrows
+5. Only take 1m arrows that align with 5m permission direction
+6. Use kill zones, IB levels, and value levels for stop/target placement
+7. **Trend days**: hold runners, favor breakout entries, widen targets
+8. **Rotation days**: take quick profits, favor mean-reversion at edges, tighten targets
 
 ## thinkScript Conventions Used
 
