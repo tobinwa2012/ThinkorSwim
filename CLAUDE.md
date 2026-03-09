@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-A **4-study thinkScript system for scalping MNQ (Micro E-mini Nasdaq-100) futures** on ThinkorSwim (TOS). The system uses a multi-timeframe approach: a 30-minute study provides macro context, two 5-minute studies establish directional bias and structural context, and a 1-minute study provides precise execution triggers.
+A **6-study thinkScript system for scalping MNQ (Micro E-mini Nasdaq-100) futures** on ThinkorSwim (TOS). The system uses a multi-timeframe approach: 4 RTH studies (30m macro context, two 5m studies for directional bias and structural context, 1m execution triggers) plus 2 ETH studies (30m and 5m) that carry frozen RTH reference data into the evening globex session (6pm-11:30pm EST).
 
 **Instrument:** MNQ (tick size = 0.25 points, $0.50/tick)
 **Platform:** ThinkorSwim by Charles Schwab
@@ -15,10 +15,12 @@ ThinkorSwim/
 ├── CLAUDE.md                                    # This file
 ├── studies/
 │   ├── 30m/
-│   │   └── MNQ_30m_Macro_Context.ts            # Session type, IB, migration, weekly VWAP
+│   │   ├── MNQ_30m_Macro_Context.ts            # RTH: Session type, IB, migration, weekly VWAP
+│   │   └── MNQ_30m_RTH_Refs_For_ETH.ts        # ETH: Frozen RTH levels for globex trading
 │   ├── 5m/
-│   │   ├── MNQ_5m_Permission_GoNoGo.ts         # Directional bias filter (ADX/DMI/VWAP)
-│   │   └── MNQ_5m_Value_Framework.ts           # Value area levels & structural alerts
+│   │   ├── MNQ_5m_Permission_GoNoGo.ts         # RTH: Directional bias filter (ADX/DMI/VWAP)
+│   │   ├── MNQ_5m_Value_Framework.ts           # RTH: Value area levels & structural alerts
+│   │   └── MNQ_5m_RTH_Refs_For_ETH.ts         # ETH: Frozen RTH levels for globex trading
 │   └── 1m/
 │       └── MNQ_1m_Sniper_Execution.ts          # Execution triggers with arrows
 ```
@@ -33,6 +35,9 @@ Each layer uses a different information source:
 - **Sniper (1m)**: Momentum timing via **EMA/MACD** (price smoothing)
 
 Agreement across independent sources carries more weight than correlated signals.
+
+### ETH Reference Studies
+Two additional studies carry frozen RTH data into the evening globex session (6pm-11:30pm EST). These do **not** produce globex-specific data — they simply preserve the most recently completed RTH session's value area, weekly VWAP, migration status, and naked POCs for use during evening trading. Both use the same dual-source Y-VA latch pattern as the RTH studies.
 
 ### Layer 0: Macro Context (`MNQ_30m_Macro_Context.ts`)
 **Timeframe:** 30-minute chart | **Role:** Session classification + macro structure
@@ -110,6 +115,40 @@ Fires discrete LONG/SHORT pulse arrows when all conditions align. Optimized for 
 - **Volume Bias proxy**: 10-bar up/down volume imbalance label (informational only)
 - Uses `useRTHOnly = yes` by default (no globex noise)
 
+### ETH Layer: 30m RTH References (`MNQ_30m_RTH_Refs_For_ETH.ts`)
+**Timeframe:** 30-minute chart | **Role:** Carry RTH levels into evening globex
+
+Provides frozen prior RTH VAH/VAL/POC, weekly VWAP, migration, and naked POCs for 6pm-11:30pm trading. No IB or session classification logic — those are RTH-only concerns.
+
+**Core logic:**
+- Same dual-source Y-VA latch as RTH studies (endOfRTH snapshot + fallback tracker)
+- `showNow = 1` — all plots/labels visible through ETH, not gated by inRTH
+- Naked POC grace period: touch detection deferred one bar after endOfRTH assignment
+- RTH-only weekly VWAP (only RTH volume contributes)
+
+**Key features:**
+- Prior RTH VAH/VAL/POC lines (yellow dashes, cyan POC)
+- Weekly VWAP (orange)
+- Up to 2 naked POCs with touch-removal logic
+- Migration label (HIGHER/LOWER/BALANCED)
+- Debug mode shows latch source (SNAP vs FALLBACK)
+
+### ETH Layer: 5m RTH References (`MNQ_5m_RTH_Refs_For_ETH.ts`)
+**Timeframe:** 5-minute chart | **Role:** Carry RTH levels into evening globex (finer granularity)
+
+Same purpose as the 30m ETH study but on the 5-minute timeframe for more precise level interaction during globex. Includes developing RTH POC in addition to prior RTH values.
+
+**Core logic:**
+- Same dual-source Y-VA latch pattern
+- Developing POC continues to show last RTH value through ETH (frozen, not updating)
+- All other logic mirrors the 30m ETH study
+
+**Key features:**
+- Prior RTH VAH/VAL/POC lines
+- Developing RTH POC (red dashes) — frozen at RTH close
+- Weekly VWAP, naked POCs, migration
+- Debug mode
+
 ## Intended Workflow
 
 1. Check **Macro Context** on 30m — trend day or rotation? How extended beyond IB? Where is weekly VWAP?
@@ -120,6 +159,13 @@ Fires discrete LONG/SHORT pulse arrows when all conditions align. Optimized for 
 6. Use kill zones, IB levels, and value levels for stop/target placement
 7. **Trend days**: hold runners, favor breakout entries, widen targets
 8. **Rotation days**: take quick profits, favor mean-reversion at edges, tighten targets
+
+### ETH (Globex) Workflow
+1. At 6pm EST, switch to charts with the ETH reference studies loaded
+2. Check **30m ETH refs** — where is price relative to prior RTH VAH/VAL/POC? Any naked POCs nearby?
+3. Check **5m ETH refs** — finer view of the same levels, plus developing POC from last RTH session
+4. Use frozen RTH levels as support/resistance for globex scalps
+5. Weekly VWAP and migration direction provide broader context
 
 ## thinkScript Conventions Used
 
