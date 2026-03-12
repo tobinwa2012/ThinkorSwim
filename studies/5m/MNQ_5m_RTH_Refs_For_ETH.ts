@@ -17,6 +17,12 @@
 #       Prevents VolumeProfile repaint from contaminating
 #       prior RTH values. Fallback tracker for robustness.
 #   (2) Debug label added to verify latch source
+#
+# v4.1 fix:
+#   Profile boundary added at endOfRTH so ETH bars go into
+#   a separate (unused) profile. Without this, ETH volume
+#   keeps updating the RTH profile and TOS retroactively
+#   shifts rawVAH/VAL/POC on historical RTH bars.
 # =========================================================
 
 declare upper;
@@ -75,9 +81,13 @@ def labelGate = if labelsLastBarOnly then isLastBar else yes;
 
 # ----------------------------
 # RTH Volume Profile
+#
+# Profile boundary at endOfRTH freezes the RTH profile.
+# ETH bars go into a separate throwaway profile so they
+# cannot retroactively shift the RTH value area on reload.
 # ----------------------------
 profile vp = VolumeProfile(
-    "startNewProfile" = newRTHSession,
+    "startNewProfile" = newRTHSession or endOfRTH,
     "onExpansion"     = no
 );
 

@@ -17,6 +17,12 @@
 #   (2) Removed: IB lines, IB structure classification,
 #       session behavior logic (per user request)
 #   (3) Kept: naked POC grace period logic from v4
+#
+# v5.1 fix:
+#   Profile boundary added at endOfRTH so ETH bars go into
+#   a separate (unused) profile. Without this, ETH volume
+#   keeps updating the RTH profile and TOS retroactively
+#   shifts rawVAH/VAL/POC on historical RTH bars.
 # =========================================================
 
 declare upper;
@@ -73,9 +79,13 @@ def labelGate = if labelsLastBarOnly then isLastBar else yes;
 
 # ----------------------------
 # RTH Volume Profile
+#
+# Profile boundary at endOfRTH freezes the RTH profile.
+# ETH bars go into a separate throwaway profile so they
+# cannot retroactively shift the RTH value area on reload.
 # ----------------------------
 profile vp = VolumeProfile(
-    "startNewProfile" = newRTHSession,
+    "startNewProfile" = newRTHSession or endOfRTH,
     "onExpansion"     = no
 );
 
