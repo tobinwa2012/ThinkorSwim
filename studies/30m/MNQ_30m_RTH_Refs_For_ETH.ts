@@ -1,5 +1,5 @@
 # =========================================================
-# MNQ_30m_RTH_Refs_For_ETH v5
+# MNQ_30m_RTH_Refs_For_ETH v6
 #
 # RTH-built references carried through ETH (6pm-11:30pm):
 #   - Prior RTH VAH / VAL / POC
@@ -9,20 +9,17 @@
 #
 # Designed for 30m chart.
 #
-# v5 changes from v4:
-#   (1) Y-VA latch fix: dual-source snapshot pattern reading
-#       rawVAH[1] directly at endOfRTH instead of dVAH[1].
-#       Prevents VolumeProfile repaint from contaminating
-#       prior RTH values. Fallback tracker for robustness.
-#   (2) Removed: IB lines, IB structure classification,
-#       session behavior logic (per user request)
-#   (3) Kept: naked POC grace period logic from v4
+# v6 changes from v5.1:
+#   The endOfRTH profile boundary produced different values
+#   than what was displayed during live RTH because it
+#   created a RTH-only bounded profile (different bar set on
+#   reload). Fix: remove endOfRTH from startNewProfile.
+#   Profile now matches the RTH studies exactly.
 #
-# v5.1 fix:
-#   Profile boundary added at endOfRTH so ETH bars go into
-#   a separate (unused) profile. Without this, ETH volume
-#   keeps updating the RTH profile and TOS retroactively
-#   shifts rawVAH/VAL/POC on historical RTH bars.
+#   Capture uses the dVAH rec (which only updates during RTH
+#   and carries forward the last RTH value) — immune to ETH
+#   bars being added to the profile because the rec stops
+#   reading rawVAH after RTH ends.
 # =========================================================
 
 declare upper;
@@ -80,12 +77,14 @@ def labelGate = if labelsLastBarOnly then isLastBar else yes;
 # ----------------------------
 # RTH Volume Profile
 #
-# Profile boundary at endOfRTH freezes the RTH profile.
-# ETH bars go into a separate throwaway profile so they
-# cannot retroactively shift the RTH value area on reload.
+# NO endOfRTH boundary. Profile matches the RTH studies
+# exactly: starts at newRTHSession, runs until next
+# newRTHSession. The dVAH/dVAL/dPOC recs only update
+# during RTH, so they freeze at RTH close regardless of
+# what VP does with ETH bars.
 # ----------------------------
 profile vp = VolumeProfile(
-    "startNewProfile" = newRTHSession or endOfRTH,
+    "startNewProfile" = newRTHSession,
     "onExpansion"     = no
 );
 
@@ -117,35 +116,26 @@ def dVAL_L = if !IsNaN(dVAL) then Round(dVAL / ts, 0) * ts else na;
 def dPOC_L = if !IsNaN(dPOC) then Round(dPOC / ts, 0) * ts else na;
 
 # =========================================================
-# Prior Completed RTH Value — DUAL-SOURCE LATCH
+# Prior Completed RTH Value
 #
-# PRIMARY: Capture rawVAH[1] directly at endOfRTH. The
-# profile is complete at 16:00 so rawVAH[1] is the final
-# value. Reading raw directly (not dVAH[1]) avoids the
-# rec chain that VolumeProfile repaint can contaminate.
+# Uses dVAH/dVAL/dPOC recs which only update during RTH.
+# At endOfRTH, dVAH = last RTH bar's rawVAH (carried fwd).
+# This is immune to ETH bars shifting rawVAH because the
+# rec stopped reading rawVAH when inRTH became false.
 #
-# FALLBACK: Running tracker during RTH that resets on
-# newRTHSession. For charts that may not show the endOfRTH
-# bar (e.g., RTH-only display mode).
+# Fallback: running tracker for RTH-only charts that lack
+# an endOfRTH bar.
 # =========================================================
 
-# --- PRIMARY: End-of-RTH snapshot ---
-rec snapVAH =
-    if BarNumber() == 1 then na
-    else if endOfRTH and !IsNaN(rawVAH[1]) then rawVAH[1]
-    else snapVAH[1];
+# --- HARD GUARD: latch once per day only ---
+rec priorLatchDay =
+    if BarNumber() == 1 then 0
+    else if endOfRTH then GetDay()
+    else priorLatchDay[1];
 
-rec snapVAL =
-    if BarNumber() == 1 then na
-    else if endOfRTH and !IsNaN(rawVAL[1]) then rawVAL[1]
-    else snapVAL[1];
+def firstLatch = endOfRTH and priorLatchDay[1] <> GetDay();
 
-rec snapPOC =
-    if BarNumber() == 1 then na
-    else if endOfRTH and !IsNaN(rawPOC[1]) then rawPOC[1]
-    else snapPOC[1];
-
-# --- FALLBACK: Running tracker, resets on newRTHSession ---
+# --- Fallback: running tracker, resets on newRTHSession ---
 rec fallbackVAH =
     if BarNumber() == 1 then na
     else if newRTHSession then na
@@ -164,19 +154,11 @@ rec fallbackPOC =
     else if (inRTH and !IsNaN(rawPOC)) then rawPOC
     else fallbackPOC[1];
 
-# --- HARD GUARD: latch once per day only ---
-rec priorLatchDay =
-    if BarNumber() == 1 then 0
-    else if endOfRTH then GetDay()
-    else priorLatchDay[1];
-
-def firstLatch = endOfRTH and priorLatchDay[1] <> GetDay();
-
-# --- Latch: prefer snapshot, fall back to tracker ---
+# --- Latch: prefer dVAH (primary), fallback if missing ---
 rec priorRTH_VAH =
     if BarNumber() == 1 then na
     else if firstLatch then
-        Round((if !IsNaN(snapVAH) then snapVAH
+        Round((if !IsNaN(dVAH) then dVAH
          else if !IsNaN(fallbackVAH[1]) then fallbackVAH[1]
          else priorRTH_VAH[1]) / ts, 0) * ts
     else priorRTH_VAH[1];
@@ -184,7 +166,7 @@ rec priorRTH_VAH =
 rec priorRTH_VAL =
     if BarNumber() == 1 then na
     else if firstLatch then
-        Round((if !IsNaN(snapVAL) then snapVAL
+        Round((if !IsNaN(dVAL) then dVAL
          else if !IsNaN(fallbackVAL[1]) then fallbackVAL[1]
          else priorRTH_VAL[1]) / ts, 0) * ts
     else priorRTH_VAL[1];
@@ -192,7 +174,7 @@ rec priorRTH_VAL =
 rec priorRTH_POC =
     if BarNumber() == 1 then na
     else if firstLatch then
-        Round((if !IsNaN(snapPOC) then snapPOC
+        Round((if !IsNaN(dPOC) then dPOC
          else if !IsNaN(fallbackPOC[1]) then fallbackPOC[1]
          else priorRTH_POC[1]) / ts, 0) * ts
     else priorRTH_POC[1];
@@ -201,7 +183,7 @@ rec priorRTH_POC =
 rec priorSource =
     if BarNumber() == 1 then 0
     else if firstLatch then
-        (if !IsNaN(snapVAH) then 1 else 2)
+        (if !IsNaN(dVAH) then 1 else 2)
     else priorSource[1];
 
 def priorReady =
@@ -375,9 +357,9 @@ AddLabel(showLabels and labelGate and showNakedPOCs,
 # Debug
 # ----------------------------
 AddLabel(showDebug and labelGate,
-    "DBG | priorSrc=" + (if priorSource == 1 then "SNAP" else if priorSource == 2 then "FALLBACK" else "NONE") +
-    " | inRTH=" + inRTH +
-    " | priorReady=" + priorReady,
+    "Src=" + (if priorSource == 1 then "dVAH" else if priorSource == 2 then "FALL" else "NONE") +
+    " | dVAH=" + (if !IsNaN(dVAH_L) then AsPrice(dVAH_L) else "na") +
+    " | final=" + AsPrice(priorRTH_VAH),
     Color.WHITE
 );
 

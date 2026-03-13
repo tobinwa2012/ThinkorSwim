@@ -1,6 +1,15 @@
 # =========================================================
-# MNQ_5m_Value_Framework v2
-# Changes from v1:
+# MNQ_5m_Value_Framework v2.1
+# Changes from v2:
+#   Profile boundary added at endOfRTH so ETH bars go into
+#   a separate throwaway profile. Without this, on chart
+#   reload TOS retroactively includes ETH volume in the RTH
+#   profile, shifting rawVAH/VAL/POC on historical bars and
+#   contaminating the Y-VA snapshot. yVAH latches at next
+#   morning's newSession, so the RTH-only profile is fully
+#   frozen by then.
+#
+# Changes from v1 (in v2):
 #   (1) Y-VA latch fix: snapshot at end-of-RTH transition (profile is
 #       complete at 16:00) instead of running tracker that can be
 #       contaminated by today's developing profile on TOS recalculation
@@ -110,9 +119,13 @@ def statusGate = if statusLastBarOnly then isLastBar else yes;
 
 # =========================================================
 # 2) Volume Profile Core (RTH session profile)
+#
+# Profile boundary at endOfRTH prevents ETH bars from
+# contaminating the RTH profile on chart reload. ETH bars
+# go into a separate throwaway profile.
 # =========================================================
 profile vp = VolumeProfile(
-    "startNewProfile" = newSession,
+    "startNewProfile" = newSession or endOfRTH,
     "onExpansion"     = no
 );
 

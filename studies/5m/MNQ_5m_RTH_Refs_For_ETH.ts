@@ -11,21 +11,20 @@
 #   - RTH Migration
 #   - 1-2 active RTH Naked POCs
 #
-# v5 changes from v4/v4.1:
-#   The profile boundary approach (startNewProfile at endOfRTH)
-#   wasn't enough to stabilize values. Root cause: TOS VP
-#   may retroactively adjust rawVAH on historical bars when
-#   recomputing, even with a profile boundary.
+# v6 changes from v5:
+#   The endOfRTH profile boundary produced "wrong" numbers
+#   because it created a RTH-only profile, while the values
+#   displayed during live RTH come from a profile that has
+#   NO endOfRTH boundary (startNewProfile = newRTHSession
+#   only, matching the RTH Value Framework). Different bar
+#   sets → different value area → values didn't match.
 #
-#   New approach:
-#   (a) Capture rawVAH directly on the LAST RTH bar using a
-#       forward reference (inRTH and !inRTH[-1]). This reads
-#       the value from INSIDE the RTH profile — no boundary
-#       timing ambiguity.
-#   (b) Keep profile boundary at endOfRTH as belt-and-suspenders.
-#   (c) Latch at endOfRTH (one bar later, snapshot already set).
-#   (d) Fallback: also capture via dVAH at endOfRTH as cross-check.
-#   (e) Enhanced debug labels showing both capture methods.
+#   Fix: remove endOfRTH from startNewProfile. Profile now
+#   matches the RTH Value Framework exactly. Capture uses
+#   the dVAH rec (which only updates during RTH and carries
+#   forward the last RTH value) — this is immune to ETH bars
+#   being added to the profile because the rec stops reading
+#   rawVAH after RTH ends.
 # =========================================================
 
 declare upper;
@@ -75,9 +74,6 @@ def newRTHSession = inRTH and seenRTHToday[1] == 0;
 # Fires once: first bar AFTER RTH ends (profile is complete)
 def endOfRTH = BarNumber() > 1 and inRTH[1] and !inRTH;
 
-# Fires on the LAST RTH bar (forward reference — works on historical bars)
-def lastRTHBar = inRTH and !inRTH[-1];
-
 # Visible through ETH
 def showNow = 1;
 
@@ -88,12 +84,14 @@ def labelGate = if labelsLastBarOnly then isLastBar else yes;
 # ----------------------------
 # RTH Volume Profile
 #
-# Profile boundary at endOfRTH freezes the RTH profile.
-# ETH bars go into a separate throwaway profile so they
-# cannot retroactively shift the RTH value area on reload.
+# NO endOfRTH boundary. Profile matches the RTH Value
+# Framework exactly: starts at newRTHSession, runs until
+# next newRTHSession. The dVAH/dVAL/dPOC recs only update
+# during RTH, so they freeze at RTH close regardless of
+# what VP does with ETH bars.
 # ----------------------------
 profile vp = VolumeProfile(
-    "startNewProfile" = newRTHSession or endOfRTH,
+    "startNewProfile" = newRTHSession,
     "onExpansion"     = no
 );
 
@@ -125,58 +123,26 @@ def dVAL_L = if !IsNaN(dVAL) then Round(dVAL / ts, 0) * ts else na;
 def dPOC_L = if !IsNaN(dPOC) then Round(dPOC / ts, 0) * ts else na;
 
 # =========================================================
-# Prior Completed RTH Value — MULTI-SOURCE CAPTURE
+# Prior Completed RTH Value
 #
-# SOURCE A (primary): Forward-reference capture on the LAST
-# RTH bar itself (inRTH and !inRTH[-1]). Reads rawVAH on
-# the bar, not rawVAH[1] from the boundary bar. No profile
-# boundary timing ambiguity.
+# Uses dVAH/dVAL/dPOC recs which only update during RTH.
+# At endOfRTH, dVAH = last RTH bar's rawVAH (carried fwd).
+# This is immune to ETH bars shifting rawVAH because the
+# rec stopped reading rawVAH when inRTH became false.
 #
-# SOURCE B (cross-check): dVAH at endOfRTH. The dVAH rec
-# only updates during RTH and carries forward. At endOfRTH,
-# dVAH = last RTH bar's value.
-#
-# SOURCE C (fallback): Running tracker during RTH that
-# resets on newRTHSession. For charts that lack both
-# endOfRTH and forward-reference resolution.
+# Fallback: running tracker for RTH-only charts that lack
+# an endOfRTH bar.
 # =========================================================
 
-# --- SOURCE A: Forward-reference capture on last RTH bar ---
-rec snapVAH =
-    if BarNumber() == 1 then na
-    else if lastRTHBar and !IsNaN(rawVAH) then rawVAH
-    else snapVAH[1];
+# --- HARD GUARD: latch once per day only ---
+rec priorLatchDay =
+    if BarNumber() == 1 then 0
+    else if endOfRTH then GetDay()
+    else priorLatchDay[1];
 
-rec snapVAL =
-    if BarNumber() == 1 then na
-    else if lastRTHBar and !IsNaN(rawVAL) then rawVAL
-    else snapVAL[1];
+def firstLatch = endOfRTH and priorLatchDay[1] <> GetDay();
 
-rec snapPOC =
-    if BarNumber() == 1 then na
-    else if lastRTHBar and !IsNaN(rawPOC) then rawPOC
-    else snapPOC[1];
-
-# --- SOURCE B: dVAH cross-check at endOfRTH ---
-# dVAH only updates during RTH. At endOfRTH it holds the
-# last RTH bar's value. This bypasses any profile boundary
-# timing issues since it reads from the rec chain.
-rec crossVAH =
-    if BarNumber() == 1 then na
-    else if endOfRTH and !IsNaN(dVAH) then dVAH
-    else crossVAH[1];
-
-rec crossVAL =
-    if BarNumber() == 1 then na
-    else if endOfRTH and !IsNaN(dVAL) then dVAL
-    else crossVAL[1];
-
-rec crossPOC =
-    if BarNumber() == 1 then na
-    else if endOfRTH and !IsNaN(dPOC) then dPOC
-    else crossPOC[1];
-
-# --- SOURCE C: Fallback running tracker ---
+# --- Fallback: running tracker, resets on newRTHSession ---
 rec fallbackVAH =
     if BarNumber() == 1 then na
     else if newRTHSession then na
@@ -195,20 +161,11 @@ rec fallbackPOC =
     else if (inRTH and !IsNaN(rawPOC)) then rawPOC
     else fallbackPOC[1];
 
-# --- HARD GUARD: latch once per day only ---
-rec priorLatchDay =
-    if BarNumber() == 1 then 0
-    else if endOfRTH then GetDay()
-    else priorLatchDay[1];
-
-def firstLatch = endOfRTH and priorLatchDay[1] <> GetDay();
-
-# --- Latch: prefer snap (A), cross-check (B), fallback (C) ---
+# --- Latch: prefer dVAH (primary), fallback if missing ---
 rec priorRTH_VAH =
     if BarNumber() == 1 then na
     else if firstLatch then
-        Round((if !IsNaN(snapVAH) then snapVAH
-         else if !IsNaN(crossVAH) then crossVAH
+        Round((if !IsNaN(dVAH) then dVAH
          else if !IsNaN(fallbackVAH[1]) then fallbackVAH[1]
          else priorRTH_VAH[1]) / ts, 0) * ts
     else priorRTH_VAH[1];
@@ -216,8 +173,7 @@ rec priorRTH_VAH =
 rec priorRTH_VAL =
     if BarNumber() == 1 then na
     else if firstLatch then
-        Round((if !IsNaN(snapVAL) then snapVAL
-         else if !IsNaN(crossVAL) then crossVAL
+        Round((if !IsNaN(dVAL) then dVAL
          else if !IsNaN(fallbackVAL[1]) then fallbackVAL[1]
          else priorRTH_VAL[1]) / ts, 0) * ts
     else priorRTH_VAL[1];
@@ -225,8 +181,7 @@ rec priorRTH_VAL =
 rec priorRTH_POC =
     if BarNumber() == 1 then na
     else if firstLatch then
-        Round((if !IsNaN(snapPOC) then snapPOC
-         else if !IsNaN(crossPOC) then crossPOC
+        Round((if !IsNaN(dPOC) then dPOC
          else if !IsNaN(fallbackPOC[1]) then fallbackPOC[1]
          else priorRTH_POC[1]) / ts, 0) * ts
     else priorRTH_POC[1];
@@ -235,9 +190,7 @@ rec priorRTH_POC =
 rec priorSource =
     if BarNumber() == 1 then 0
     else if firstLatch then
-        (if !IsNaN(snapVAH) then 1
-         else if !IsNaN(crossVAH) then 2
-         else 3)
+        (if !IsNaN(dVAH) then 1 else 2)
     else priorSource[1];
 
 def priorReady =
@@ -416,48 +369,14 @@ AddLabel(showLabels and labelGate and showNakedPOCs,
 # ----------------------------
 # Debug — enable showDebug to diagnose value shifts
 #
-# Src: SNAP = forward-ref capture on last RTH bar
-#      CROSS = dVAH at endOfRTH
-#      FALL = running tracker
-#
-# snap/cross show the raw captured values (pre-latch).
-# If snap != cross, the profile boundary is causing a
-# discrepancy between rawVAH and dVAH.
+# Src: dVAH = primary (rec only updates during RTH)
+#      FALL = running tracker fallback
 # ----------------------------
 AddLabel(showDebug and labelGate,
-    "Src=" + (if priorSource == 1 then "SNAP"
-     else if priorSource == 2 then "CROSS"
-     else if priorSource == 3 then "FALL"
-     else "NONE"),
+    "Src=" + (if priorSource == 1 then "dVAH" else if priorSource == 2 then "FALL" else "NONE") +
+    " | dVAH=" + (if !IsNaN(dVAH_L) then AsPrice(dVAH_L) else "na") +
+    " | final=" + AsPrice(priorRTH_VAH),
     Color.WHITE
-);
-
-AddLabel(showDebug and labelGate,
-    "snap=" +
-    (if !IsNaN(snapVAH) then AsPrice(Round(snapVAH / ts, 0) * ts) else "na") +
-    "/" +
-    (if !IsNaN(snapVAL) then AsPrice(Round(snapVAL / ts, 0) * ts) else "na") +
-    "/" +
-    (if !IsNaN(snapPOC) then AsPrice(Round(snapPOC / ts, 0) * ts) else "na"),
-    Color.LIGHT_GRAY
-);
-
-AddLabel(showDebug and labelGate,
-    "cross=" +
-    (if !IsNaN(crossVAH) then AsPrice(Round(crossVAH / ts, 0) * ts) else "na") +
-    "/" +
-    (if !IsNaN(crossVAL) then AsPrice(Round(crossVAL / ts, 0) * ts) else "na") +
-    "/" +
-    (if !IsNaN(crossPOC) then AsPrice(Round(crossPOC / ts, 0) * ts) else "na"),
-    Color.LIGHT_GRAY
-);
-
-AddLabel(showDebug and labelGate,
-    "final=" +
-    AsPrice(priorRTH_VAH) + "/" +
-    AsPrice(priorRTH_VAL) + "/" +
-    AsPrice(priorRTH_POC),
-    Color.YELLOW
 );
 
 # ----------------------------

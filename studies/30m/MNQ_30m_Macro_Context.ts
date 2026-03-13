@@ -1,5 +1,14 @@
 # =========================================================
-# MNQ_30m_Macro_Context v1
+# MNQ_30m_Macro_Context v1.1
+#
+# v1.1 changes from v1:
+#   Profile boundary added at endOfRTH so ETH bars go into
+#   a separate throwaway profile. Without this, on chart
+#   reload TOS retroactively includes ETH volume in the RTH
+#   profile, shifting rawVAH/VAL/POC on historical bars and
+#   contaminating the Y-VA snapshot. yVAH latches at next
+#   morning's newSession, so the RTH-only profile is fully
+#   frozen by then.
 #
 # Purpose: Higher-timeframe context layer for the MNQ scalping system.
 #   Answers questions the 5m/1m studies cannot:
@@ -97,9 +106,13 @@ def labelGate = if labelsLastBarOnly then isLastBar else yes;
 
 # ----------------------------
 # 2) Volume Profile + Y-VA (endOfRTH snapshot fix)
+#
+# Profile boundary at endOfRTH prevents ETH bars from
+# contaminating the RTH profile on chart reload. ETH bars
+# go into a separate throwaway profile.
 # ----------------------------
 profile vp = VolumeProfile(
-    "startNewProfile" = newSession,
+    "startNewProfile" = newSession or endOfRTH,
     "onExpansion"     = no
 );
 
