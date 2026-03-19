@@ -1,5 +1,5 @@
 # =========================================================
-# MNQ_5m_RTH_Refs_For_ETH v5
+# MNQ_5m_RTH_Refs_For_ETH v7
 #
 # Purpose:
 #   RTH-built context layer for 5m chart, visible through ETH.
@@ -11,20 +11,20 @@
 #   - RTH Migration
 #   - 1-2 active RTH Naked POCs
 #
-# v6 changes from v5:
-#   The endOfRTH profile boundary produced "wrong" numbers
-#   because it created a RTH-only profile, while the values
-#   displayed during live RTH come from a profile that has
-#   NO endOfRTH boundary (startNewProfile = newRTHSession
-#   only, matching the RTH Value Framework). Different bar
-#   sets → different value area → values didn't match.
+# v7 changes from v6:
+#   v6 removed the endOfRTH profile boundary, relying on
+#   dVAH alone. Problem: without the boundary, TOS VP
+#   retroactively recalculates rawVAH on RTH bars to include
+#   ETH volume on chart reload. Since dVAH reads rawVAH
+#   during RTH, it picks up the contaminated values.
 #
-#   Fix: remove endOfRTH from startNewProfile. Profile now
-#   matches the RTH Value Framework exactly. Capture uses
-#   the dVAH rec (which only updates during RTH and carries
-#   forward the last RTH value) — this is immune to ETH bars
-#   being added to the profile because the rec stops reading
-#   rawVAH after RTH ends.
+#   Fix: BOTH boundary AND dVAH capture together.
+#   (a) Profile boundary at endOfRTH isolates RTH profile —
+#       ETH bars go into a throwaway profile, so rawVAH on
+#       RTH bars stays clean on reload.
+#   (b) dVAH rec captures from the clean RTH profile — no
+#       boundary-bar timing ambiguity (reads actual RTH bars,
+#       not rawVAH[1] from the boundary bar).
 # =========================================================
 
 declare upper;
@@ -84,14 +84,13 @@ def labelGate = if labelsLastBarOnly then isLastBar else yes;
 # ----------------------------
 # RTH Volume Profile
 #
-# NO endOfRTH boundary. Profile matches the RTH Value
-# Framework exactly: starts at newRTHSession, runs until
-# next newRTHSession. The dVAH/dVAL/dPOC recs only update
-# during RTH, so they freeze at RTH close regardless of
-# what VP does with ETH bars.
+# Boundary at endOfRTH puts ETH bars into a throwaway
+# profile so they cannot retroactively shift rawVAH on
+# RTH bars during chart reload. dVAH reads from the
+# clean RTH-only profile during RTH, then carries forward.
 # ----------------------------
 profile vp = VolumeProfile(
-    "startNewProfile" = newRTHSession,
+    "startNewProfile" = newRTHSession or endOfRTH,
     "onExpansion"     = no
 );
 

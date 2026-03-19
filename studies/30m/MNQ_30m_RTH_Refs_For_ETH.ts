@@ -1,5 +1,5 @@
 # =========================================================
-# MNQ_30m_RTH_Refs_For_ETH v6
+# MNQ_30m_RTH_Refs_For_ETH v7
 #
 # RTH-built references carried through ETH (6pm-11:30pm):
 #   - Prior RTH VAH / VAL / POC
@@ -9,17 +9,17 @@
 #
 # Designed for 30m chart.
 #
-# v6 changes from v5.1:
-#   The endOfRTH profile boundary produced different values
-#   than what was displayed during live RTH because it
-#   created a RTH-only bounded profile (different bar set on
-#   reload). Fix: remove endOfRTH from startNewProfile.
-#   Profile now matches the RTH studies exactly.
+# v7 changes from v6:
+#   v6 removed the profile boundary, relying on dVAH alone.
+#   Problem: without the boundary, TOS VP retroactively
+#   recalculates rawVAH on RTH bars to include ETH volume on
+#   chart reload. Since dVAH reads rawVAH during RTH, it
+#   picks up the contaminated values.
 #
-#   Capture uses the dVAH rec (which only updates during RTH
-#   and carries forward the last RTH value) — immune to ETH
-#   bars being added to the profile because the rec stops
-#   reading rawVAH after RTH ends.
+#   Fix: BOTH boundary AND dVAH capture together.
+#   (a) Profile boundary at endOfRTH isolates RTH profile.
+#   (b) dVAH rec captures from the clean RTH profile — no
+#       boundary-bar timing ambiguity.
 # =========================================================
 
 declare upper;
@@ -77,14 +77,13 @@ def labelGate = if labelsLastBarOnly then isLastBar else yes;
 # ----------------------------
 # RTH Volume Profile
 #
-# NO endOfRTH boundary. Profile matches the RTH studies
-# exactly: starts at newRTHSession, runs until next
-# newRTHSession. The dVAH/dVAL/dPOC recs only update
-# during RTH, so they freeze at RTH close regardless of
-# what VP does with ETH bars.
+# Boundary at endOfRTH puts ETH bars into a throwaway
+# profile so they cannot retroactively shift rawVAH on
+# RTH bars during chart reload. dVAH reads from the
+# clean RTH-only profile during RTH, then carries forward.
 # ----------------------------
 profile vp = VolumeProfile(
-    "startNewProfile" = newRTHSession,
+    "startNewProfile" = newRTHSession or endOfRTH,
     "onExpansion"     = no
 );
 
